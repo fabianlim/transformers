@@ -474,6 +474,7 @@ class GPTQConfig(QuantizationConfigMixin):
         batch_size: int = 1,
         pad_token_id: Optional[int] = None,
         use_exllama: Optional[bool] = None,
+        use_marlin: Optional[bool] = None,
         max_input_length: Optional[int] = None,
         exllama_config: Optional[Dict[str, Any]] = None,
         cache_block_outputs: bool = True,
@@ -496,6 +497,7 @@ class GPTQConfig(QuantizationConfigMixin):
         self.batch_size = batch_size
         self.pad_token_id = pad_token_id
         self.use_exllama = use_exllama
+        self.use_marlin = use_marlin
         self.max_input_length = max_input_length
         self.exllama_config = exllama_config
         self.disable_exllama = kwargs.pop("disable_exllama", None)
@@ -505,7 +507,7 @@ class GPTQConfig(QuantizationConfigMixin):
 
     def get_loading_attributes(self):
         attibutes_dict = copy.deepcopy(self.__dict__)
-        loading_attibutes = ["disable_exllama", "use_exllama", "exllama_config", "use_cuda_fp16", "max_input_length"]
+        loading_attibutes = ["disable_exllama", "use_exllama", "use_marlin", "exllama_config", "use_cuda_fp16", "max_input_length"]
         loading_attibutes_dict = {i: j for i, j in attibutes_dict.items() if i in loading_attibutes}
         return loading_attibutes_dict
 
@@ -590,6 +592,7 @@ class GPTQConfig(QuantizationConfigMixin):
         quant_dict = self.to_dict()
         # make it compatible with optimum config
         quant_dict["disable_exllama"] = not self.use_exllama
+        quant_dict["disable_marlin"] = not self.use_marlin
         return quant_dict
 
     @classmethod
@@ -602,6 +605,11 @@ class GPTQConfig(QuantizationConfigMixin):
             config_dict["use_exllama"] = not config_dict["disable_exllama"]
             # switch to None to not trigger the warning
             config_dict["disable_exllama"] = None
+
+        if "disable_marlin" in config_dict:
+            config_dict["use_marlin"] = not config_dict["disable_marlin"]
+            # switch to None to not trigger the warning
+            config_dict["disable_marlin"] = None
 
         config = cls(**config_dict)
         return config
