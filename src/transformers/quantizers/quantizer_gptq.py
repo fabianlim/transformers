@@ -92,3 +92,22 @@ class GptqHfQuantizer(HfQuantizer):
     @property
     def is_serializable(self):
         return True
+
+    @property
+    def has_custom_weight_loading(self):
+        # use the custom loader in the marlin case
+        return self.optimum_quantizer.disable_marlin == False
+
+    def _model_weight_loading(self, model, *args):
+        assert not self.optimum_quantizer.disable_marlin, "custom loader only for marlin"
+
+        # TODO: may replace this
+        from optimum.gptq.quantizer import replace_marlin_linear_and_load_checkpoint
+        pretrained_model_name_or_path, torch_dtype, device_map = args
+        return replace_marlin_linear_and_load_checkpoint(
+            model,
+            pretrained_model_name_or_path,
+            torch_dtype, device_map,
+            self.optimum_quantizer.disable_exllama, 
+            self.optimum_quantizer.exllama_config
+        )

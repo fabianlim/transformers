@@ -3517,46 +3517,30 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             # restore default dtype
             if dtype_orig is not None:
                 torch.set_default_dtype(dtype_orig)
-
-            if hf_quantizer is not None:
-                from optimum.gptq.quantizer import replace_marlin_linear_and_load_checkpoint
-
-                # hf_quantizer.pre_quantized should be True
-                # hf_quantizer.disable_marlin also needs to be checked
-                model, offload_index = replace_marlin_linear_and_load_checkpoint(
-                    model,
-                    pretrained_model_name_or_path,
-                    torch_dtype, device_map,
-                    hf_quantizer.optimum_quantizer.disable_exllama, 
-                    hf_quantizer.optimum_quantizer.exllama_config
-                    
-                )
-                missing_keys, unexpected_keys, mismatched_keys, error_msgs = [], [], [], []
-            else:
-                (
-                    model,
-                    missing_keys,
-                    unexpected_keys,
-                    mismatched_keys,
-                    offload_index,
-                    error_msgs,
-                ) = cls._load_pretrained_model(
-                    model,
-                    state_dict,
-                    loaded_state_dict_keys,  # XXX: rename?
-                    resolved_archive_file,
-                    pretrained_model_name_or_path,
-                    ignore_mismatched_sizes=ignore_mismatched_sizes,
-                    sharded_metadata=sharded_metadata,
-                    _fast_init=_fast_init,
-                    low_cpu_mem_usage=low_cpu_mem_usage,
-                    device_map=device_map,
-                    offload_folder=offload_folder,
-                    offload_state_dict=offload_state_dict,
-                    dtype=torch_dtype,
-                    hf_quantizer=hf_quantizer,
-                    keep_in_fp32_modules=keep_in_fp32_modules,
-                )
+            (
+                model,
+                missing_keys,
+                unexpected_keys,
+                mismatched_keys,
+                offload_index,
+                error_msgs,
+            ) = cls._load_pretrained_model(
+                model,
+                state_dict,
+                loaded_state_dict_keys,  # XXX: rename?
+                resolved_archive_file,
+                pretrained_model_name_or_path,
+                ignore_mismatched_sizes=ignore_mismatched_sizes,
+                sharded_metadata=sharded_metadata,
+                _fast_init=_fast_init,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                device_map=device_map,
+                offload_folder=offload_folder,
+                offload_state_dict=offload_state_dict,
+                dtype=torch_dtype,
+                hf_quantizer=hf_quantizer,
+                keep_in_fp32_modules=keep_in_fp32_modules,
+            )
 
         # make sure token embedding weights are still tied if needed
         model.tie_weights()
@@ -3911,6 +3895,13 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 ignore_mismatched_sizes,
             )
             error_msgs = _load_state_dict_into_model(model_to_load, state_dict, start_prefix)
+            offload_index = None
+        elif hf_quantizer is not None and hf_quantizer.has_custom_weight_loading:
+            model = hf_quantizer._model_weight_loading(
+                model_to_load, pretrained_model_name_or_path, dtype, device_map
+            )
+            # TODO: fix these
+            missing_keys, unexpected_keys, mismatched_keys, error_msgs = [], [], [], []
             offload_index = None
         else:
             # Sharded checkpoint or whole but low_cpu_mem_usage==True

@@ -195,3 +195,12 @@ class HfQuantizer(ABC):
     @abstractmethod
     def is_trainable(self):
         ...
+
+    @property
+    def has_custom_weight_loading(self):
+        return False
+
+    @property
+    @abstractmethod
+    def _model_weight_loading(self, model, *args):
+        ...
