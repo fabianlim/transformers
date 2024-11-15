@@ -152,6 +152,7 @@ class Mamba2Cache:
         }
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
+        self.key_value_memory_dict = {}
 
     def update_conv_state(
         self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
@@ -625,6 +626,24 @@ class Mamba2RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+# FIXME:
+from mamba_ssm.modules.mlp import GatedMLP
+# from ..llama.modeling_llama import LLAMA_ATTENTION_CLASSES
+from mamba_ssm.modules.mha import MHA
+
+from types import MethodType
+def patch_mha_forward(mha: nn.Module):
+    
+    _old_forward = mha.forward
+    def _forward(self, x, cache_params: Mamba2Cache, **kwargs):
+        cache_params.max_seqlen = 128
+        cache_params.lengths_per_sample = None
+        cache_params.batch_size_offset = 0
+
+        return _old_forward(x, inference_params=cache_params)
+
+    mha.forward = MethodType(_forward, mha)
+
 class Mamba2Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -632,7 +651,35 @@ class Mamba2Block(nn.Module):
         self.layer_idx = layer_idx
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
+
+        # attn_cls = LLAMA_ATTENTION_CLASSES['flash_attention_2']
+        attn_layer_idx = getattr(config, "attn_layer_idx", None)
+        if attn_layer_idx and layer_idx in attn_layer_idx:
+            self.mixer = MHA(
+                embed_dim=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_heads_kv=config.num_key_value_heads,
+                # rotary_emb_dim=64, # FIXME:
+                head_dim=(config.hidden_size // config.num_attention_heads),
+                rotary_emb_dim=(config.hidden_size // config.num_attention_heads // 2),
+                rotary_emb_base=config.rope_theta,
+                qkv_proj_bias=config.attention_bias,
+                out_proj_bias=config.attention_bias,
+                layer_idx=layer_idx,
+                causal=True,
+                dtype=config.torch_dtype, # FIXME:
+            )
+            patch_mha_forward(self.mixer)
+        else:
+            self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
+
+        # FIXME: 
+        self.norm2 = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.mlp = GatedMLP(
+            hidden_features=config.intermediate_size,
+            in_features=config.hidden_size,
+            out_features=config.hidden_size,
+        )
 
     def forward(
         self,
@@ -650,6 +697,16 @@ class Mamba2Block(nn.Module):
             hidden_states, cache_params=cache_params, cache_position=cache_position, attention_mask=attention_mask
         )
         hidden_states = residual + hidden_states
+
+        # FIXME:
+        residual = hidden_states 
+        hidden_states = self.norm2(hidden_states.to(dtype=self.norm2.weight.dtype))
+        if self.residual_in_fp32:
+            residual = residual.to(torch.float32)
+
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
         return hidden_states
 
 
