@@ -232,13 +232,16 @@ class MambaAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_heads_kv = config.num_key_value_heads
         self.hidden_size = config.hidden_size
-        self.head_dim = (config.hidden_size // config.num_attention_heads)
-        self.rotary_emb_dim = self.head_dim // 2
-        self.rotary_emb_base = config.rope_theta
-        self.qkv_proj_bias=config.attention_bias
-        self.out_proj_bias=config.attention_bias
-        self.softmax_scale = None
+        self.head_dim = config.attention_head_dim
+        self.rotary_emb_dim = config.attention_rotary_emb_dim
+        self.rotary_emb_base = config.attention_rope_theta
+        self.qkv_proj_bias=config.attention_qkv_bias
+        self.out_proj_bias=config.attention_out_bias
+        self.softmax_scale = config.attention_softmax_scale
         self.layer_idx = layer_idx
+
+        assert config.attention_d_conv == 0, \
+            "currently only support d_conv=0 for hybrid attention."
 
         assert (
             self.num_heads % self.num_heads_kv == 0
@@ -856,21 +859,24 @@ class Mamba2RMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 class Mamba2Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Mamba2Config, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        attn_layer_idx = getattr(config, "attn_layer_idx", None)
-        if attn_layer_idx and layer_idx in attn_layer_idx:
+        attn_layer_idxs = config.attention_layer_indices
+        if attn_layer_idxs and layer_idx in attn_layer_idxs:
             self.mixer = MambaAttention(config, layer_idx=layer_idx)
         else:
             self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
         # FIXME: there needs to be an extra config that infers frmo the MLP dim
+        self.has_mlp = False
         if config.intermediate_size:
+            self.has_mlp = True
+
             self.norm2 = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
             # FIXME: what about the bias? require a 
@@ -879,6 +885,7 @@ class Mamba2Block(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act, # we just use this
+                bias=False,
             )
 
     def forward(
@@ -898,14 +905,14 @@ class Mamba2Block(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # FIXME:
-        residual = hidden_states 
-        hidden_states = self.norm2(hidden_states.to(dtype=self.norm2.weight.dtype))
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        if self.has_mlp:
+            residual = hidden_states 
+            hidden_states = self.norm2(hidden_states.to(dtype=self.norm2.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
 
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return hidden_states
 
