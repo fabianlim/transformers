@@ -114,6 +114,7 @@ class Mamba2Config(PretrainedConfig):
         head_dim=64,
         vocab_size=32768,
         hidden_size=4096,
+        intermediate_size=14336,
         state_size=128,
         num_hidden_layers=64,
         layer_norm_epsilon=1e-5,
@@ -138,10 +139,22 @@ class Mamba2Config(PretrainedConfig):
         rms_norm=True,
         chunk_size=256,
         tie_word_embeddings=False,
+        attention_causal=True,
+        attention_d_conv=0,
+        attention_head_dim=128,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        attention_qkv_bias=False,
+        attention_out_bias=False,
+        attention_rotary_emb_dim=64,
+        attention_rope_theta=10000.0,
+        attention_softmax_scale=None,
+        attention_layer_indices=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.state_size = state_size
         self.num_hidden_layers = num_hidden_layers
         self.layer_norm_epsilon = layer_norm_epsilon
@@ -170,6 +183,18 @@ class Mamba2Config(PretrainedConfig):
         self.chunk_size = chunk_size
         self.time_step_limit = time_step_limit
         self.tie_word_embeddings = tie_word_embeddings
+
+        self.attention_causal = attention_causal
+        self.attention_d_conv = attention_d_conv 
+        self.attention_head_dim = attention_head_dim
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.attention_qkv_bias = attention_qkv_bias
+        self.attention_out_bias = attention_out_bias
+        self.attention_rotary_emb_dim = attention_rotary_emb_dim
+        self.attention_rope_theta = attention_rope_theta
+        self.attention_softmax_scale = attention_softmax_scale
+        self.attention_layer_indices = attention_layer_indices
 
         super().__init__(
             bos_token_id=bos_token_id,
