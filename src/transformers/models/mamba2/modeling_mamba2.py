@@ -22,6 +22,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...generation import GenerationMixin
@@ -35,9 +36,6 @@ from ...utils import (
 )
 from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available
 from .configuration_mamba2 import Mamba2Config
-
-from einops import rearrange
-import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)
 
@@ -387,10 +385,13 @@ class Mamba2Mixer(nn.Module):
                 # storing the states
                 # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                xBC_t = rearrange(hidden_states_B_C, "b l d -> b d l")
                 cache_params.conv_states[
                     self.layer_idx
-                ].copy_(F.pad(xBC_t, (self.conv_kernel_size - xBC_t.shape[-1], 0)))  # Update state (B D W)
+                ].copy_(F.pad(
+                    # xBC_t, 
+                    hidden_states_B_C.permute(0, 2,1),
+                    (self.conv_kernel_size - hidden_states_B_C.shape[1], 0)
+                ))  # Update state (B D W)
 
                 # 1D Convolution
                 if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
