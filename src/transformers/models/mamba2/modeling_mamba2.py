@@ -170,6 +170,28 @@ class Mamba2Cache:
         self.conv_states.zero_()
         self.ssm_states.zero_()
 
+class MambaGatedMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool = False,
+        hidden_act: str = 'silu'
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.fc1 = nn.Linear(hidden_size, 2 * intermediate_size, bias=bias)
+        self.activation = hidden_act
+        self.act = ACT2FN[hidden_act]
+        self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=bias)
+
+    def forward(self, hidden_states):
+        hidden_states = self.fc1(hidden_states)
+        up_proj, gate = hidden_states.chunk(2, dim=-1)
+        up_proj = up_proj * self.act(gate)
+        return self.fc2(up_proj)
+
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -627,7 +649,7 @@ class Mamba2RMSNorm(nn.Module):
 
 
 # FIXME:
-from mamba_ssm.modules.mlp import GatedMLP
+# from mamba_ssm.modules.mlp import GatedMLP
 # from ..llama.modeling_llama import LLAMA_ATTENTION_CLASSES
 from mamba_ssm.modules.mha import MHA
 
@@ -673,13 +695,22 @@ class Mamba2Block(nn.Module):
         else:
             self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
-        # FIXME: 
-        self.norm2 = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GatedMLP(
-            hidden_features=config.intermediate_size,
-            in_features=config.hidden_size,
-            out_features=config.hidden_size,
-        )
+        # FIXME: there needs to be an extra config that infers frmo the MLP dim
+        if config.intermediate_size:
+            self.norm2 = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+            # self.mlp = GatedMLP(
+            #     hidden_features=config.intermediate_size,
+            #     in_features=config.hidden_size,
+            #     out_features=config.hidden_size,
+            # )
+
+            # FIXME: what about the bias? require a 
+            # config.mlp_bias?
+            self.mlp = MambaGatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act, # we just use this
+            )
 
     def forward(
         self,
