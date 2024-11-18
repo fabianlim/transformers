@@ -34,8 +34,11 @@ from ...utils import (
     add_start_docstrings_to_model_forward,
     logging,
 )
-from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available
+from ...utils.import_utils import is_causal_conv1d_available, is_mamba_2_ssm_available, is_flash_attn_2_available
 from .configuration_mamba2 import Mamba2Config
+
+# FIXME 
+from einops import rearrange
 
 logger = logging.get_logger(__name__)
 
@@ -50,6 +53,12 @@ if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
     causal_conv1d_update, causal_conv1d_fn = None, None
+
+if is_flash_attn_2_available:
+    from flash_attn import flash_attn_with_kvcache
+    from flash_attn.layers.rotary import RotaryEmbedding
+else:
+    flash_attn_with_kvcache, RotaryEmbedding = None, None
 
 is_fast_path_available = all((selective_state_update, causal_conv1d_fn, causal_conv1d_update))
 
@@ -130,6 +139,7 @@ class Mamba2Cache:
         self, config: Mamba2Config, batch_size: int, dtype: torch.dtype = torch.float16, device: Optional[str] = None
     ):
         self.seqlen_offset = 0
+        self.batch_size_offset = 0
         self.dtype = dtype
         self.conv_kernel_size = config.conv_kernel
         self.intermediate_size = int(config.expand * config.hidden_size)
@@ -152,6 +162,10 @@ class Mamba2Cache:
         }
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
+
+        # FIXM:E 
+        self.max_seqlen = 128
+        self.lengths_per_sample = None
         self.key_value_memory_dict = {}
 
     def update_conv_state(
@@ -192,6 +206,189 @@ class MambaGatedMLP(nn.Module):
         up_proj = up_proj * self.act(gate)
         return self.fc2(up_proj)
 
+def _update_kv_cache(kv, cache_params: Mamba2Cache, layer_idx: int):
+    """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+    # Pre-allocate memory for key-values for inference.
+    num_heads, head_dim = kv.shape[-2:]
+    assert layer_idx in cache_params.key_value_memory_dict
+    kv_cache = cache_params.key_value_memory_dict[layer_idx]
+    # Adjust key and value for inference
+    batch_start = cache_params.batch_size_offset
+    batch_end = batch_start + kv.shape[0]
+    sequence_start = cache_params.seqlen_offset
+    sequence_end = sequence_start + kv.shape[1]
+    assert batch_end <= kv_cache.shape[0]
+    assert sequence_end <= kv_cache.shape[1]
+    assert kv_cache is not None
+    kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+    return kv_cache[batch_start:batch_end, :sequence_end, ...]
+
+class MambaAttention(nn.Module):
+
+    def __init__(self, config: Mamba2Config, layer_idx: int):
+        super().__init__()
+
+        # this is different from num_heads, used to configure the mixer
+        self.num_heads = config.num_attention_heads
+        self.num_heads_kv = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = (config.hidden_size // config.num_attention_heads)
+        self.rotary_emb_dim = self.head_dim // 2
+        self.rotary_emb_base = config.rope_theta
+        self.qkv_proj_bias=config.attention_bias
+        self.out_proj_bias=config.attention_bias
+        self.softmax_scale = None
+        self.layer_idx = layer_idx
+
+        assert (
+            self.num_heads % self.num_heads_kv == 0
+        ), "num_heads must be divisible by num_heads_kv"
+        qkv_dim = self.head_dim * (self.num_heads + 2 * self.num_heads_kv)
+        out_dim = self.head_dim * self.num_heads
+
+        if self.rotary_emb_dim > 0:
+            assert RotaryEmbedding is not None, "rotary requires flash_attn to be installed"
+            self.rotary_emb = RotaryEmbedding(
+                self.rotary_emb_dim,
+                base=self.rotary_emb_base,
+                interleaved=False,
+            )
+
+        self.in_proj = nn.Linear(self.hidden_size, qkv_dim, bias=self.qkv_proj_bias)
+        self.out_proj = nn.Linear(out_dim, self.hidden_size, bias=self.out_proj_bias)
+    
+    def forward(
+        self, 
+        hidden_states, 
+        cache_params: Optional[Mamba2Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        # if self.layer_idx == 9:
+        #     import pdb; pdb.set_trace()
+
+        if cache_params is not None and self.layer_idx not in cache_params.key_value_memory_dict:
+            cache_params.key_value_memory_dict[self.layer_idx] = torch.empty(
+                hidden_states.shape[0], cache_params.max_seqlen, 2, self.num_heads_kv, self.head_dim,
+                dtype=self.in_proj.weight.dtype, 
+                device=self.in_proj.weight.device,
+            )
+        seqlen_offset = (
+            0
+            if cache_params is None
+            else (
+                cache_params.lengths_per_sample
+                if cache_params.lengths_per_sample is not None
+                else cache_params.seqlen_offset
+            )
+        )
+        rotary_max_seqlen = cache_params.max_seqlen if cache_params is not None else None
+        qkv = self.in_proj(hidden_states)
+        
+        q, kv = qkv.split([self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim], dim=-1)
+        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+        kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+        if (
+            cache_params is None
+            or cache_params.seqlen_offset == 0
+            or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+        ):
+            if self.rotary_emb_dim > 0:
+                q, kv = self.rotary_emb(
+                    q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+                )
+            if cache_params is None:
+                k, v = kv.unbind(dim=-3)
+                k = torch.repeat_interleave(k, dim=2, repeats=self.num_heads // self.num_heads_kv)
+                v = torch.repeat_interleave(v, dim=2, repeats=self.num_heads // self.num_heads_kv)
+                context = F.scaled_dot_product_attention(
+                    q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=self.causal, scale=self.softmax_scale
+                ).transpose(1, 2)
+            else:
+                context = self._update_kvcache_attention(q, kv, cache_params)
+        else:
+            context = self._apply_rotary_update_kvcache_attention(q, kv, cache_params)
+        context = rearrange(context, "... h d -> ... (h d)")
+        out = self.out_proj(context)
+        return out
+
+    def _update_kv_cache(self, kv, cache_params: Mamba2Cache):
+        """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+        assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
+        return _update_kv_cache(kv, cache_params, self.layer_idx)
+
+    def _apply_rotary_update_kvcache_attention(self, q, kv, cache_params: Mamba2Cache):
+        """
+        Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
+        q: (batch_size, seqlen_q, nheads, head_dim)
+        kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
+        """
+        assert cache_params is not None and cache_params.seqlen_offset > 0
+        if self.rotary_emb_dim > 0:
+            self.rotary_emb._update_cos_sin_cache(
+                cache_params.max_seqlen, device=q.device, dtype=q.dtype
+            )
+            rotary_cos, rotary_sin = self.rotary_emb._cos_cached, self.rotary_emb._sin_cached
+        else:
+            rotary_cos, rotary_sin = None, None
+        batch = q.shape[0]
+        kv_cache = cache_params.key_value_memory_dict[self.layer_idx]
+        kv_cache = kv_cache[:batch]
+        cache_seqlens = (
+            cache_params.lengths_per_sample[:batch]
+            if cache_params.lengths_per_sample is not None
+            else cache_params.seqlen_offset
+        )
+        assert flash_attn_with_kvcache is not None, "flash_attn must be installed"
+        context = flash_attn_with_kvcache(
+            q,
+            kv_cache[:, :, 0],
+            kv_cache[:, :, 1],
+            kv[:, :, 0],
+            kv[:, :, 1],
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=self.softmax_scale,
+            causal=True,
+            rotary_interleaved=self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False,
+        )
+        return context
+
+    def _update_kvcache_attention(self, q, kv, cache_params: Mamba2Cache):
+        """Write kv to cache_params, then do attention"""
+        if (
+            cache_params.seqlen_offset == 0
+            or flash_attn_with_kvcache is None
+        ):
+            # TODO: this only uses seqlen_offset and not lengths_per_sample.
+            kv = self._update_kv_cache(kv, cache_params)
+            k, v = kv.unbind(dim=-3)
+            k = torch.repeat_interleave(k, dim=2, repeats=self.num_heads // self.num_heads_kv)
+            v = torch.repeat_interleave(v, dim=2, repeats=self.num_heads // self.num_heads_kv)
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+                is_causal=True, scale=self.softmax_scale
+            ).transpose(1, 2)
+        else:
+            batch = q.shape[0]
+            kv_cache = cache_params.key_value_memory_dict[self.layer_idx]
+            kv_cache = kv_cache[:batch]
+            cache_seqlens = (
+                cache_params.lengths_per_sample[:batch]
+                if cache_params.lengths_per_sample is not None
+                else cache_params.seqlen_offset
+            )
+            return flash_attn_with_kvcache(
+                q,
+                kv_cache[:, :, 0],
+                kv_cache[:, :, 1],
+                kv[:, :, 0],
+                kv[:, :, 1],
+                cache_seqlens=cache_seqlens,
+                softmax_scale=self.softmax_scale,
+                causal=True,
+            )
 
 class MambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -658,25 +855,6 @@ class Mamba2RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
-
-# FIXME:
-# from mamba_ssm.modules.mlp import GatedMLP
-# from ..llama.modeling_llama import LLAMA_ATTENTION_CLASSES
-from mamba_ssm.modules.mha import MHA
-
-from types import MethodType
-def patch_mha_forward(mha: nn.Module):
-    
-    _old_forward = mha.forward
-    def _forward(self, x, cache_params: Mamba2Cache, **kwargs):
-        cache_params.max_seqlen = 128
-        cache_params.lengths_per_sample = None
-        cache_params.batch_size_offset = 0
-
-        return _old_forward(x, inference_params=cache_params)
-
-    mha.forward = MethodType(_forward, mha)
-
 class Mamba2Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -685,35 +863,15 @@ class Mamba2Block(nn.Module):
         self.residual_in_fp32 = config.residual_in_fp32
         self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        # attn_cls = LLAMA_ATTENTION_CLASSES['flash_attention_2']
         attn_layer_idx = getattr(config, "attn_layer_idx", None)
         if attn_layer_idx and layer_idx in attn_layer_idx:
-            self.mixer = MHA(
-                embed_dim=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                num_heads_kv=config.num_key_value_heads,
-                # rotary_emb_dim=64, # FIXME:
-                head_dim=(config.hidden_size // config.num_attention_heads),
-                rotary_emb_dim=(config.hidden_size // config.num_attention_heads // 2),
-                rotary_emb_base=config.rope_theta,
-                qkv_proj_bias=config.attention_bias,
-                out_proj_bias=config.attention_bias,
-                layer_idx=layer_idx,
-                causal=True,
-                dtype=config.torch_dtype, # FIXME:
-            )
-            patch_mha_forward(self.mixer)
+            self.mixer = MambaAttention(config, layer_idx=layer_idx)
         else:
             self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
         # FIXME: there needs to be an extra config that infers frmo the MLP dim
         if config.intermediate_size:
             self.norm2 = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-            # self.mlp = GatedMLP(
-            #     hidden_features=config.intermediate_size,
-            #     in_features=config.hidden_size,
-            #     out_features=config.hidden_size,
-            # )
 
             # FIXME: what about the bias? require a 
             # config.mlp_bias?
