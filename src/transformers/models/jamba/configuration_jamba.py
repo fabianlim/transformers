@@ -153,7 +153,11 @@ class JambaConfig(PretrainedConfig):
         expert_layer_offset=1,
         attn_layer_period=8,
         attn_layer_offset=4,
+        attn_layer_indices=None,
         use_mamba_kernels=True,
+        mamba_version="v1",
+        mamba_n_heads=128,
+        mamba_n_groups=1,
         mamba_d_state=16,
         mamba_d_conv=4,
         mamba_expand=2,
@@ -192,11 +196,23 @@ class JambaConfig(PretrainedConfig):
         self.expert_layer_offset = expert_layer_offset
         self.attn_layer_period = attn_layer_period
         self.attn_layer_offset = attn_layer_offset
+        self.attn_layer_indices = attn_layer_indices
 
-        self._check_supported_offset("attention", self.attn_layer_period, self.attn_layer_offset)
-        self._check_supported_offset("expert", self.expert_layer_period, self.expert_layer_offset)
+        assert (
+            (self.attn_layer_indices and not self.attn_layer_period)
+            or 
+            (not self.attn_layer_indices and self.attn_layer_period)
+        ), "Please only specify either attn_layer_period and attn_layer_indices."
 
+        if self.attn_layer_period:
+            self._check_supported_offset("attention", self.attn_layer_period, self.attn_layer_offset)
+        if self.expert_layer_period:
+            self._check_supported_offset("expert", self.expert_layer_period, self.expert_layer_offset)
+
+        self.mamba_version = mamba_version
         self.use_mamba_kernels = use_mamba_kernels
+        self.mamba_n_heads = mamba_n_heads
+        self.mamba_n_groups = mamba_n_groups
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
         self.mamba_expand = mamba_expand
@@ -215,14 +231,24 @@ class JambaConfig(PretrainedConfig):
     @property
     def layers_block_type(self):
         return [
-            "attention" if i % self.attn_layer_period == self.attn_layer_offset else "mamba"
+            "attention" if (
+                (
+                    self.attn_layer_period and
+                    (i % self.attn_layer_period == self.attn_layer_offset)
+                ) or (
+                    i in self.attn_layer_indices
+                )
+            ) else "mamba"
             for i in range(self.num_hidden_layers)
         ]
-
+        
     @property
     def layers_num_experts(self):
         return [
-            self.num_experts if i % self.expert_layer_period == self.expert_layer_offset else 1
+            self.num_experts if (
+                self.expert_layer_period and
+                (i % self.expert_layer_period == self.expert_layer_offset)
+            ) else 1
             for i in range(self.num_hidden_layers)
         ]
 
