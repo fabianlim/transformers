@@ -38,6 +38,7 @@ from ...modeling_outputs import (
     MoeModelOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from ...modeling_utils import PreTrainedModel
 from ...utils import (
     add_start_docstrings,
@@ -50,19 +51,28 @@ from ...utils.import_utils import (
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
     is_mamba_ssm_available,
+    is_mamba_2_ssm_available,
 )
 from .configuration_jamba import JambaConfig
 
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
-
+    from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary
+else:
+    RotaryEmbedding = None
 
 if is_mamba_ssm_available():
     from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 else:
     selective_state_update, selective_scan_fn, mamba_inner_fn = None, None, None
+
+if is_mamba_2_ssm_available():
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+else:
+    selective_state_update = None
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -239,6 +249,10 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
         self.key_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
         self.value_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
 
+
+        # FIXME:
+        self.seqlen_offset = 0
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -284,6 +298,77 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
     def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
         raise NotImplementedError("HybridMambaAttentionDynamicCache does not have a legacy cache equivalent.")
 
+class JambaRotaryEmbedding(nn.Module):
+    def __init__(self, config: JambaConfig):
+        super().__init__()
+
+        # FIXME: 
+        self.dim = 64
+        # self.max_position_embeddings = max_position_embeddings
+        self.base = 10000.
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    # copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding.forward
+    # TODO(joao): add me back asap :)
+    def forward(self, x, position_ids):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 since bfloat16 loses precision on long contexts
+        # See https://github.com/huggingface/transformers/pull/29285
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    m, n = cos.shape[-1], q.shape[-1]
+
+    q_sub = q[...,:m]
+    k_sub = k[...,:m]
+    q_embed = (q_sub * cos) + (rotate_half(q_sub) * sin)
+    k_embed = (k_sub * cos) + (rotate_half(k_sub) * sin)
+    if m < n:
+        q_embed = torch.cat([q_embed, q[..., m:]], dim=-1)
+        k_embed = torch.cat([k_embed, k[..., m:]], dim=-1)
+    return q_embed, k_embed
 
 # Adapted from transformers.models.mistral.modeling_mistral.MistralAttention with Mistral->Jamba
 class JambaAttention(nn.Module):
@@ -321,6 +406,19 @@ class JambaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
+        # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
+        # FIXME
+        self.rotary_emb = JambaRotaryEmbedding(config=self.config)
+
+        # self.rotary_emb_dim = 64
+        # if self.rotary_emb_dim > 0:
+        #     assert RotaryEmbedding is not None, "rotary requires flash_attn to be installed"
+        #     self.rotary_emb = RotaryEmbedding(
+        #         self.rotary_emb_dim,
+        #         base=10000.,
+        #         interleaved=False,
+        #     )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -340,6 +438,10 @@ class JambaAttention(nn.Module):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # FIXME
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -416,6 +518,10 @@ class JambaFlashAttention2(JambaAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # FIXME
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -516,6 +622,10 @@ class JambaSdpaAttention(JambaAttention):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # add rope
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -830,6 +940,273 @@ class JambaMambaMixer(nn.Module):
             return self.cuda_kernels_forward(hidden_states, cache_params, attention_mask)
         return self.slow_forward(hidden_states, cache_params, attention_mask)
 
+# Taken from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
+class JambaMambaRMSNormGated(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        if gate is not None:
+            hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        return self.weight * hidden_states.to(input_dtype)
+
+
+# Taken from transformers.models.mamba2.modeling_mamba2.Mamba2Mixer
+class JambaMamba2Mixer(nn.Module):
+    """
+    Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
+    A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
+    ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
+    and is why Mamba is called **selective** state spaces)
+    """
+
+    def __init__(self, config: JambaConfig, layer_idx: int):
+        super().__init__()
+        self.num_heads = config.mamba_n_heads
+        self.hidden_size = config.hidden_size
+        self.ssm_state_size = config.mamba_d_state
+        self.conv_kernel_size = config.mamba_d_conv
+        self.intermediate_size = int(config.mamba_expand * self.hidden_size)
+        self.layer_idx = layer_idx
+        self.use_conv_bias = config.mamba_conv_bias
+        self.activation = config.hidden_act
+        self.act = ACT2FN[config.hidden_act]
+        self.use_bias = config.mamba_proj_bias
+
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        self.n_groups = config.mamba_n_groups
+        # self.head_dim = config.head_dim
+        # self.head_dim = config.hidden_size // config.mamba_n_heads
+        self.head_dim = 64 # FIXME
+        self.chunk_size = 256 # config.chunk_size # FIXME
+
+        # self.time_step_limit = config.time_step_limit
+        # self.time_step_min = config.time_step_min
+        # self.time_step_max = config.time_step_max
+
+        # FIXME:
+        self.time_step_limit = (0.0, float("inf"))
+        self.time_step_min = 0.001
+        self.time_step_max = 0.1
+
+        self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=config.mamba_conv_bias,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        # projection of the input hidden states
+        projection_size = self.intermediate_size + self.conv_dim + self.num_heads
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            projection_size,
+            bias=self.use_bias,
+        )
+        # selective projection used to make dt, B and C input dependant
+
+        # time step projection (discretization)
+        # instantiate once and copy inv_dt in init_weights of PretrainedModel
+        self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
+
+        # S4D real initialization. These are not discretized!
+        # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
+        A = torch.arange(1, self.num_heads + 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+        self.norm = JambaMambaRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon)
+        self.D = nn.Parameter(torch.ones(self.num_heads))
+        self.D._no_weight_decay = True
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
+
+        if not is_fast_path_available:
+            logger.warning_once(
+                "The fast path is not available because on of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
+                " is None. Falling back to the naive implementation. To install follow https://github.com/state-spaces/mamba/#installation and"
+                " https://github.com/Dao-AILab/causal-conv1d"
+            )
+
+    def cuda_kernels_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        # set up dimensions for reshapes later
+
+        batch_size, seq_len, _ = hidden_states.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+        d_to_remove = 2 * self.intermediate_size + 2 * self.n_groups * self.ssm_state_size + self.num_heads
+
+        # getting projected states from cache if it exists
+        if cache_params is not None and cache_params.seqlen_offset > 0:
+            in_projected_states = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
+            d_mlp = (in_projected_states.shape[-1] - d_to_remove) // 2
+            split_projection_dim = [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads]
+            _, _, gate, hidden_states_B_C, dt = torch.split(in_projected_states, split_projection_dim, dim=-1)
+
+            hidden_states_B_C = causal_conv1d_update(
+                hidden_states_B_C,
+                cache_params.conv_states[self.layer_idx],
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+
+            hidden_states, B, C = torch.split(
+                hidden_states_B_C,
+                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                dim=-1,
+            )
+            A = -torch.exp(self.A_log.float())  # (nheads,)
+
+            A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D = self.D[:, None, ...].expand(-1, self.head_dim)
+            B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
+            C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
+            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            hidden_states = selective_state_update(
+                cache_params.ssm_states[self.layer_idx],
+                hidden_states_reshaped,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+            )
+            hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
+            hidden_states = self.norm(hidden_states, gate)
+            out = self.out_proj(hidden_states)[:, None, ...]
+        # if no cache is found, calling the kernel
+        else:
+            if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+                # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
+                dtype = hidden_states.dtype
+                hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+            # 1. Gated MLP's linear projection
+            projected_states = self.in_proj(hidden_states)
+            A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
+            dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
+
+            if self.training and cache_params is None:
+                out, ssm_state = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=None,  # was seq_idx
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight,
+                    rmsnorm_eps=self.norm.variance_epsilon,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=self.head_dim,
+                    ngroups=self.n_groups,
+                    norm_before_gate=False,
+                    return_final_states=True,
+                    **dt_limit_kwargs,
+                )
+
+            else:
+                gate, hidden_states_B_C, time_step = torch.split(
+                    projected_states,
+                    [self.intermediate_size, self.conv_dim, self.num_heads],
+                    dim=-1,
+                )
+
+                # storing the states
+                # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                cache_params.conv_states[
+                    self.layer_idx
+                ].copy_(F.pad(
+                    # xBC_t, 
+                    hidden_states_B_C.permute(0, 2,1),
+                    (self.conv_kernel_size - hidden_states_B_C.shape[1], 0)
+                ))  # Update state (B D W)
+
+                # 1D Convolution
+                if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+                    hidden_states_B_C = self.act(
+                        self.conv1d(hidden_states_B_C.transpose(1, 2)).transpose(1, 2)[:, :seq_len]
+                    )  # (B, L, self.d_inner + 2 * ngroups * d_state)
+                else:
+                    hidden_states_B_C = causal_conv1d_fn(
+                        x=hidden_states_B_C.transpose(1, 2),
+                        weight=self.conv1d.weight.squeeze(1),
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                    ).transpose(1, 2)[:, :seq_len]
+                hidden_states, B, C = torch.split(
+                    hidden_states_B_C,
+                    [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                    dim=-1,
+                )
+                if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+                    # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
+                    dtype = hidden_states.dtype
+                    hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+                scan_output, ssm_state = mamba_chunk_scan_combined(
+                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    time_step,
+                    A,
+                    B.view(batch_size, seq_len, self.n_groups, -1),
+                    C.view(batch_size, seq_len, self.n_groups, -1),
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=None,
+                    seq_idx=None,
+                    return_final_states=True,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    **dt_limit_kwargs,
+                )
+                if ssm_state is not None and cache_params is not None:
+                    cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
+                scan_output = scan_output.view(batch_size, seq_len, -1)
+                # Multiply "gate" branch and apply extra normalization layer
+                scan_output = self.norm(scan_output, gate)
+                out = self.out_proj(scan_output)
+        return out
+
+    def forward(
+        self,
+        hidden_states,
+        cache_params: Optional[HybridMambaAttentionDynamicCache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
+            return self.cuda_kernels_forward(hidden_states, cache_params, attention_mask)
+
+        raise NotImplementedError("slow path currently not supported for Mamba2 in Jamba.")
+        # dtype = hidden_states.dtype
+        # if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        #     # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
+        #     hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+        # return self.torch_forward(hidden_states, cache_params, cache_position, attention_mask)
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Jamba
 class JambaMLP(nn.Module):
@@ -996,7 +1373,13 @@ class JambaMambaDecoderLayer(nn.Module):
     def __init__(self, config: JambaConfig, layer_idx: int):
         super().__init__()
         num_experts = config.layers_num_experts[layer_idx]
-        self.mamba = JambaMambaMixer(config=config, layer_idx=layer_idx)
+
+        if config.mamba_version == "v1":
+            self.mamba = JambaMambaMixer(config=config, layer_idx=layer_idx)
+        elif config.mamba_version == "v2":
+            self.mamba = JambaMamba2Mixer(config=config, layer_idx=layer_idx)
+        else:
+            raise NotImplementedError
 
         ffn_layer_class = JambaSparseMoeBlock if num_experts > 1 else JambaMLP
         self.feed_forward = ffn_layer_class(config)
