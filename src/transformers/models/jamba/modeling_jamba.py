@@ -311,7 +311,6 @@ class JambaRotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     # copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding.forward
-    # TODO(joao): add me back asap :)
     def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
@@ -361,10 +360,17 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
     m, n = cos.shape[-1], q.shape[-1]
 
-    q_sub = q[...,:m]
-    k_sub = k[...,:m]
+    # - follow https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/layers/rotary.py
+    # to allow for the case where the rotary dim is smaller than the head dim
+    if m < n:
+        q_sub = q[...,:m]
+        k_sub = k[...,:m]
+    else:
+        q_sub, k_sub = q, k
+
     q_embed = (q_sub * cos) + (rotate_half(q_sub) * sin)
     k_embed = (k_sub * cos) + (rotate_half(k_sub) * sin)
+
     if m < n:
         q_embed = torch.cat([q_embed, q[..., m:]], dim=-1)
         k_embed = torch.cat([k_embed, k[..., m:]], dim=-1)
@@ -406,6 +412,7 @@ class JambaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
+        self.rotary_emb = None
         if config.attn_rotary_emb:
             self.rotary_emb = JambaRotaryEmbedding(config=self.config)
 
@@ -429,9 +436,9 @@ class JambaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # FIXME
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rotary_emb:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -509,9 +516,9 @@ class JambaFlashAttention2(JambaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # FIXME
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rotary_emb:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -614,8 +621,9 @@ class JambaSdpaAttention(JambaAttention):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         # add rope
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.rotary_emb:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
@@ -1355,18 +1363,18 @@ class JambaAttentionDecoderLayer(nn.Module):
 
         return outputs
 
+JAMBA_MIXER_CLASSES = {
+    "v1": JambaMambaMixer,
+    "v2": JambaMamba2Mixer,
+}
 
 class JambaMambaDecoderLayer(nn.Module):
     def __init__(self, config: JambaConfig, layer_idx: int):
         super().__init__()
         num_experts = config.layers_num_experts[layer_idx]
 
-        if config.mamba_version == "v1":
-            self.mamba = JambaMambaMixer(config=config, layer_idx=layer_idx)
-        elif config.mamba_version == "v2":
-            self.mamba = JambaMamba2Mixer(config=config, layer_idx=layer_idx)
-        else:
-            raise NotImplementedError
+        mixer_class = JAMBA_MIXER_CLASSES[config.mamba_version]
+        self.mamba = mixer_class(config=config, layer_idx=layer_idx)
 
         ffn_layer_class = JambaSparseMoeBlock if num_experts > 1 else JambaMLP
         self.feed_forward = ffn_layer_class(config)
