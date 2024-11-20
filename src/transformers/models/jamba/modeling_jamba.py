@@ -58,9 +58,6 @@ from .configuration_jamba import JambaConfig
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
-    from flash_attn.layers.rotary import RotaryEmbedding, apply_rotary
-else:
-    RotaryEmbedding = None
 
 if is_mamba_ssm_available():
     from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
@@ -222,24 +219,32 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
     and `ssm_states` represents the ssm state and has a shape of `(batch_size, d_inner, d_state)`.
     """
 
-    def __init__(self, config, batch_size, dtype=torch.float16, device=None):
+    def __init__(self, config: JambaConfig, batch_size, dtype=torch.float16, device=None):
         super().__init__()
         self.dtype = dtype
         self.layers_block_type = config.layers_block_type
         self.has_previous_state = False  # only used by mamba
-        intermediate_size = config.mamba_expand * config.hidden_size
-        ssm_state_size = config.mamba_d_state
         conv_kernel_size = config.mamba_d_conv
+        ssm_state_size = config.mamba_d_state
+        cache_dims_conv_states = [config.mamba_expand * config.hidden_size, conv_kernel_size]
+        cache_dims_ssm_states = [config.mamba_expand * config.hidden_size, ssm_state_size]
+        if config.mamba_version == 'v2':
+            cache_dims_conv_states[0] += 2 * config.mamba_n_groups * ssm_state_size
+            # ssm cache dependent on heads instead
+            cache_dims_ssm_states = [
+                config.mamba_n_heads, config.mamba_d_head
+            ] + cache_dims_ssm_states[-1:]
+
         self.conv_states = []
         self.ssm_states = []
         self.transformer_layers = []
         for i in range(config.num_hidden_layers):
             if self.layers_block_type[i] == "mamba":
                 self.conv_states += [
-                    torch.zeros(batch_size, intermediate_size, conv_kernel_size, device=device, dtype=dtype)
+                    torch.zeros(batch_size, *cache_dims_conv_states, device=device, dtype=dtype)
                 ]
                 self.ssm_states += [
-                    torch.zeros(batch_size, intermediate_size, ssm_state_size, device=device, dtype=dtype)
+                    torch.zeros(batch_size, *cache_dims_ssm_states, device=device, dtype=dtype)
                 ]
             else:
                 self.conv_states += [torch.tensor([[]] * batch_size, device=device)]
@@ -248,10 +253,6 @@ class HybridMambaAttentionDynamicCache(DynamicCache):
 
         self.key_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
         self.value_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
-
-
-        # FIXME:
-        self.seqlen_offset = 0
 
     def update(
         self,
@@ -303,8 +304,7 @@ class JambaRotaryEmbedding(nn.Module):
         super().__init__()
 
         # FIXME: 
-        self.dim = 64
-        # self.max_position_embeddings = max_position_embeddings
+        self.dim = config.attn_rotary_emb
         self.base = 10000.
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -406,18 +406,8 @@ class JambaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
-        # FIXME
-        self.rotary_emb = JambaRotaryEmbedding(config=self.config)
-
-        # self.rotary_emb_dim = 64
-        # if self.rotary_emb_dim > 0:
-        #     assert RotaryEmbedding is not None, "rotary requires flash_attn to be installed"
-        #     self.rotary_emb = RotaryEmbedding(
-        #         self.rotary_emb_dim,
-        #         base=10000.,
-        #         interleaved=False,
-        #     )
+        if config.attn_rotary_emb:
+            self.rotary_emb = JambaRotaryEmbedding(config=self.config)
 
     def forward(
         self,
@@ -984,19 +974,13 @@ class JambaMamba2Mixer(nn.Module):
         self.layer_norm_epsilon = config.rms_norm_eps
 
         self.n_groups = config.mamba_n_groups
-        # self.head_dim = config.head_dim
-        # self.head_dim = config.hidden_size // config.mamba_n_heads
-        self.head_dim = 64 # FIXME
-        self.chunk_size = 256 # config.chunk_size # FIXME
-
-        # self.time_step_limit = config.time_step_limit
-        # self.time_step_min = config.time_step_min
-        # self.time_step_max = config.time_step_max
+        self.head_dim = config.mamba_d_head
+        self.chunk_size = config.mamba_chunk_size 
 
         # FIXME:
         self.time_step_limit = (0.0, float("inf"))
-        self.time_step_min = 0.001
-        self.time_step_max = 0.1
+        # self.time_step_min = 0.001
+        # self.time_step_max = 0.1
 
         self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
         self.conv1d = nn.Conv1d(
@@ -1051,8 +1035,17 @@ class JambaMamba2Mixer(nn.Module):
         groups_time_state_size = self.n_groups * self.ssm_state_size
         d_to_remove = 2 * self.intermediate_size + 2 * self.n_groups * self.ssm_state_size + self.num_heads
 
+        use_precomputed_states = (
+            cache_params is not None
+            and cache_params.has_previous_state
+            and seq_len == 1
+            and cache_params.conv_states[self.layer_idx].shape[0]
+            == cache_params.ssm_states[self.layer_idx].shape[0]
+            == batch_size
+        )
+
         # getting projected states from cache if it exists
-        if cache_params is not None and cache_params.seqlen_offset > 0:
+        if use_precomputed_states:
             in_projected_states = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
             d_mlp = (in_projected_states.shape[-1] - d_to_remove) // 2
             split_projection_dim = [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads]
@@ -1200,13 +1193,7 @@ class JambaMamba2Mixer(nn.Module):
         if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
             return self.cuda_kernels_forward(hidden_states, cache_params, attention_mask)
 
-        raise NotImplementedError("slow path currently not supported for Mamba2 in Jamba.")
-        # dtype = hidden_states.dtype
-        # if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
-        #     # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
-        #     hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-
-        # return self.torch_forward(hidden_states, cache_params, cache_position, attention_mask)
+        raise NotImplementedError("Jamba currently does not support slow path for Mamba2.")
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Jamba
 class JambaMLP(nn.Module):
