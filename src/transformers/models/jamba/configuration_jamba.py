@@ -154,13 +154,16 @@ class JambaConfig(PretrainedConfig):
         attn_layer_period=8,
         attn_layer_offset=4,
         attn_layer_indices=None,
+        attn_rotary_emb=None,
         use_mamba_kernels=True,
         mamba_version="v1",
         mamba_n_heads=128,
+        mamba_d_head=64,
         mamba_n_groups=1,
         mamba_d_state=16,
         mamba_d_conv=4,
         mamba_expand=2,
+        mamba_chunk_size=256,
         mamba_dt_rank="auto",
         mamba_conv_bias=True,
         mamba_proj_bias=False,
@@ -197,25 +200,31 @@ class JambaConfig(PretrainedConfig):
         self.attn_layer_period = attn_layer_period
         self.attn_layer_offset = attn_layer_offset
         self.attn_layer_indices = attn_layer_indices
+        self.attn_rotary_emb = attn_rotary_emb
 
+        # we add attn_layer_indices to support assignments not possible with attn_layer_period and
+        # attn_layer_offset, where the latter enforces attn_layer_offset < attn_layer_period
         assert (
             (self.attn_layer_indices and not self.attn_layer_period)
-            or 
+            or
             (not self.attn_layer_indices and self.attn_layer_period)
-        ), "Please only specify either attn_layer_period and attn_layer_indices."
+        ), "Specify either attn_layer_period and attn_layer_indices, but not both."
 
+        # expert layers completely turned-off when expert_layer_period=None
         if self.attn_layer_period:
             self._check_supported_offset("attention", self.attn_layer_period, self.attn_layer_offset)
-        if self.expert_layer_period:
-            self._check_supported_offset("expert", self.expert_layer_period, self.expert_layer_offset)
+        self._check_supported_offset("expert", self.expert_layer_period, self.expert_layer_offset)
 
+        # support different versions of the mamba mixer
         self.mamba_version = mamba_version
         self.use_mamba_kernels = use_mamba_kernels
         self.mamba_n_heads = mamba_n_heads
+        self.mamba_d_head = mamba_d_head
         self.mamba_n_groups = mamba_n_groups
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
         self.mamba_expand = mamba_expand
+        self.mamba_chunk_size = mamba_chunk_size
         self.mamba_dt_rank = math.ceil(self.hidden_size / 16) if mamba_dt_rank == "auto" else mamba_dt_rank
         self.mamba_conv_bias = mamba_conv_bias
         self.mamba_proj_bias = mamba_proj_bias
@@ -245,10 +254,9 @@ class JambaConfig(PretrainedConfig):
     @property
     def layers_num_experts(self):
         return [
-            self.num_experts if (
-                self.expert_layer_period and
+            self.num_experts if 
                 (i % self.expert_layer_period == self.expert_layer_offset)
-            ) else 1
+            else 1
             for i in range(self.num_hidden_layers)
         ]
 
