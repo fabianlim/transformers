@@ -239,6 +239,7 @@ class MambaAttention(nn.Module):
         self.out_proj_bias=config.attention_out_bias
         self.softmax_scale = config.attention_softmax_scale
         self.layer_idx = layer_idx
+        self.causal = True
 
         assert config.attention_d_conv == 0, \
             "currently only support d_conv=0 for hybrid attention."
@@ -585,13 +586,14 @@ class Mamba2Mixer(nn.Module):
                 # storing the states
                 # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                cache_params.conv_states[
-                    self.layer_idx
-                ].copy_(F.pad(
-                    # xBC_t, 
-                    hidden_states_B_C.permute(0, 2,1),
-                    (self.conv_kernel_size - hidden_states_B_C.shape[1], 0)
-                ))  # Update state (B D W)
+                if cache_params:
+                    cache_params.conv_states[
+                        self.layer_idx
+                    ].copy_(F.pad(
+                        # xBC_t, 
+                        hidden_states_B_C.permute(0, 2,1),
+                        (self.conv_kernel_size - hidden_states_B_C.shape[1], 0)
+                    ))  # Update state (B D W)
 
                 # 1D Convolution
                 if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
@@ -1133,6 +1135,22 @@ class Mamba2Model(Mamba2PreTrainedModel):
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
+        
+        # SOME attempts at fixing the cache but not successful yet
+        # if cache_position is not None and use_cache:
+        #     # when generate is called, it will generate a cache position, and only then initialize the cache params
+        #     cache_params = Mamba2Cache(
+        #         self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
+        #     )
+        #     # cache_position = torch.arange(0, self.config.conv_kernel, device=inputs_embeds.device)
+        # else:
+        #     # cases when we do manual forward instead of using `model.generate` which will initiate
+        #     # `cache_position` and makes sure it is not None, we will just assume its a regular model forward and 
+        #     # disable the cache
+        #     cache_params = None
+
+        # - this logic is strange because it could be possible that cache_position
+        #   could be already prepared by "prepare_generation_inputs", so why is it purposely overwritten again?
 
         if use_cache:
             if cache_params is None:
@@ -1170,7 +1188,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if use_cache:
+        if use_cache and cache_params is not None:
             cache_params.seqlen_offset += inputs_embeds.shape[1]
 
         hidden_states = self.norm_f(hidden_states)
@@ -1228,7 +1246,6 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwitten -- uses `cache_params` as opposed to `past_key_values`
-
         if inputs_embeds is not None:
             past_len = inputs_embeds.shape[1] + input_ids.shape[1]
         else:
