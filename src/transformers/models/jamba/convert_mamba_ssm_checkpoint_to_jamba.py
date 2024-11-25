@@ -84,6 +84,8 @@ def convert_ssm_config_to_hf_config(config_ssm: Dict) -> JambaConfig:
     """Convert a JambaConfig from mamba_ssm to a JambaConfig from here."""
     hf_config: JambaConfig = JambaConfig()
 
+    hf_config.architectures = ["JambaForCausalLM"]
+
     # there are some configs unsettable by mamba_ssn config, so setting to some 
     # internal defaults
     hf_config.mamba_d_head = 64
