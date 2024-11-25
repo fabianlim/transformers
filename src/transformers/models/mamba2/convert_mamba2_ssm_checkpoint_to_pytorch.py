@@ -38,7 +38,13 @@ def load_state_dict_from_safetensors(mamba2_checkpoint_path: str, ckpt_name: str
 
 
 def load_state_dict_from_torch(mamba2_checkpoint_path: str, ckpt_name: str) -> Dict[str, torch.Tensor]:
-    return torch.load(path.join(mamba2_checkpoint_path, ckpt_name), map_location="cpu")
+    original_state_dict = torch.load(path.join(mamba2_checkpoint_path, ckpt_name), map_location="cpu")
+    key_map = {
+        'backbone.embedding.weight': 'backbone.embeddings.weight',
+    }
+    return {
+        key_map.get(k,k):v for k,v in original_state_dict.items()
+    }
 
 
 def convert_ssm_config_to_hf_config(config_ssm: Dict, mamba2_model_dict: Dict) -> Mamba2Config:
@@ -50,6 +56,7 @@ def convert_ssm_config_to_hf_config(config_ssm: Dict, mamba2_model_dict: Dict) -
 
     # Set important values from config and recalculate other resulting entries
     hf_config.hidden_size = config_ssm[config_dict["hidden_size"]]
+    hf_config.intermediate_size = config_ssm[config_dict["intermediate_size"]]
     hf_config.num_heads = (hf_config.hidden_size * hf_config.expand) // hf_config.head_dim
     hf_config.num_hidden_layers = config_ssm[config_dict["num_hidden_layers"]]
     hf_config.n_groups = config_ssm.get(config_dict["n_groups"], 1)
@@ -57,6 +64,22 @@ def convert_ssm_config_to_hf_config(config_ssm: Dict, mamba2_model_dict: Dict) -
     hf_config.bos_token_id = config_dict["bos_token_id"]
     hf_config.pad_token_id = config_dict["pad_token_id"]
     hf_config.eos_token_id = config_dict["eos_token_id"]
+
+    # Set attention values
+    attn_cfg = config_ssm.get("attn_cfg")
+    if attn_cfg:
+        hf_config.attention_causal = attn_cfg["causal"]
+        hf_config.attention_d_conv = attn_cfg["d_conv"]
+        hf_config.attention_head_dim = attn_cfg["head_dim"]
+        hf_config.attention_rotary_emb_dim = attn_cfg["rotary_emb_dim"]
+        hf_config.num_attention_heads = attn_cfg["num_heads"]
+        hf_config.num_key_value_heads = attn_cfg["num_heads_kv"]
+        hf_config.attention_qkv_bias = attn_cfg["qkv_proj_bias"]
+        hf_config.attention_out_bias = attn_cfg["out_proj_bias"]
+
+    attention_layer_indices = config_ssm.get("attn_layer_idx")
+    if attention_layer_indices:
+        hf_config.attention_layer_indices = attention_layer_indices
 
     # Padded vocab size, mostly of 16 but 32 is also very common in different models
     vocab_size = config_ssm["vocab_size"]
@@ -79,7 +102,7 @@ def load_and_save_tokenizer(
     if tokenizer_model_path is not None and mamba2_model_type == "codestral":
         tokenizer_class = LlamaTokenizerFast
         tokenizer = tokenizer_class(tokenizer_model_path, legacy=False, from_slow=True)
-    elif mamba2_model_type == "mamba_ssm":
+    elif tokenizer_model_path is not None and mamba2_model_type == "mamba_ssm":
         tokenizer = GPTNeoXTokenizerFast.from_pretrained("state-spaces/mamba-130m-hf", padding_side="left")
 
     # Save tokenizer
@@ -102,10 +125,11 @@ _MAMBA2_MODELS_DICT = {
     "mamba_ssm": {
         "hidden_size": "d_model",
         "num_hidden_layers": "n_layer",
+        "intermediate_size": "d_intermediate",
         "n_groups": "ngroups",
         "bos_token_id": 0,
-        "pad_token_id": 0,
-        "eos_token_id": 0,
+        "pad_token_id": 1,
+        "eos_token_id": 2,
         "config_name": "config.json",
         "load_state_dict": partial(load_state_dict_from_torch, ckpt_name="pytorch_model.bin"),
         "load_and_save_tokenizer": partial(load_and_save_tokenizer, "mamba_ssm"),
