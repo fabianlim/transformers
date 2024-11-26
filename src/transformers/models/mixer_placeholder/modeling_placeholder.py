@@ -48,7 +48,6 @@ from ...utils.import_utils import (
     is_causal_conv1d_available,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
-    is_mamba_ssm_available,
     is_mamba_2_ssm_available,
 )
 from .configuration_placeholder import PlaceholderConfig
@@ -56,12 +55,6 @@ from .configuration_placeholder import PlaceholderConfig
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
-
-if is_mamba_ssm_available():
-    from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-else:
-    selective_state_update, selective_scan_fn, mamba_inner_fn = None, None, None
 
 if is_mamba_2_ssm_available():
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -75,7 +68,7 @@ else:
     causal_conv1d_update, causal_conv1d_fn = None, None
 
 is_fast_path_available = all(
-    (selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)
+    (selective_state_update, causal_conv1d_fn, causal_conv1d_update)
 )
 
 
