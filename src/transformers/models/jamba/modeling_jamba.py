@@ -1046,7 +1046,6 @@ class JambaMamba2Mixer(nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
         groups_time_state_size = self.n_groups * self.ssm_state_size
-        d_to_remove = 2 * self.intermediate_size + 2 * self.n_groups * self.ssm_state_size + self.num_heads
 
         use_precomputed_states = (
             cache_params is not None
@@ -1060,9 +1059,8 @@ class JambaMamba2Mixer(nn.Module):
         # getting projected states from cache if it exists
         if use_precomputed_states:
             in_projected_states = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-            d_mlp = (in_projected_states.shape[-1] - d_to_remove) // 2
-            split_projection_dim = [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads]
-            _, _, gate, hidden_states_B_C, dt = torch.split(in_projected_states, split_projection_dim, dim=-1)
+            split_projection_dim = [self.intermediate_size, self.conv_dim, self.num_heads]
+            gate, hidden_states_B_C, dt = torch.split(in_projected_states, split_projection_dim, dim=-1)
 
             hidden_states_B_C = causal_conv1d_update(
                 hidden_states_B_C,
@@ -1103,6 +1101,11 @@ class JambaMamba2Mixer(nn.Module):
             out = self.out_proj(hidden_states)[:, None, ...]
         # if no cache is found, calling the kernel
         else:
+
+            # consider supporting padding free, taking reference from below
+            # - https://github.com/state-spaces/mamba/blob/442fab4b1fd5226c1b5939b37d91ede430b5d1ae/mamba_ssm/modules/mamba2.py#L256-L259
+            # - projected_states needs to be rearrange(projected_states, "(b l) d -> b l d", l=seqlen)
+            # - then out needs to be rearrange(out, "b l d -> (b l) d")
             if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
                 # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
                 dtype = hidden_states.dtype
@@ -1136,6 +1139,14 @@ class JambaMamba2Mixer(nn.Module):
                 )
 
             else:
+                # this part required the first forward (i.e. prefill forward) when performing
+                # generation, and the cache needs to be initialized.
+
+                # NOTE: take reference from here and consider implementing padding free 
+                # - https://github.com/state-spaces/mamba/blob/442fab4b1fd5226c1b5939b37d91ede430b5d1ae/mamba_ssm/modules/mamba2.py#L256-L259
+                # 1. needs to get the conv_states using causal_conv1d_varlen_states
+                # 2. cu_seqlen needs to be passed into mamba_chunk_scan_combined and return_varlen_states has to be set
+                # 3. ssm_state needs special handling to be updated
                 gate, hidden_states_B_C, time_step = torch.split(
                     projected_states,
                     [self.intermediate_size, self.conv_dim, self.num_heads],
