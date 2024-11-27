@@ -26,7 +26,7 @@ from transformers.utils import SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from safetensors.torch import save_file
 import re
 import os
-from .configuration_placeholder import PlaceholderConfig
+from .configuration_bamba import BambaConfig
 
 def convert_state_dict_from_mamba_ssm(original_sd: Dict) -> Dict[str, torch.Tensor]:
     state_dict = {}
@@ -85,11 +85,11 @@ def convert_state_dict_from_mamba_ssm(original_sd: Dict) -> Dict[str, torch.Tens
 def convert_ssm_config_to_hf_config(
     config_ssm: Dict,
     **kwargs,
-) -> PlaceholderConfig:
-    """Convert a config from mamba_ssm to a PlaceholderConfig from here."""
-    hf_config: PlaceholderConfig = PlaceholderConfig(**kwargs)
+) -> BambaConfig:
+    """Convert a config from mamba_ssm to a BambaConfig from here."""
+    hf_config: BambaConfig = BambaConfig(**kwargs)
 
-    hf_config.architectures = ["PlaceholderForCausalLM"]
+    hf_config.architectures = ["BambaForCausalLM"]
 
     # Set important values from config and recalculate other resulting entries
     hf_config.hidden_size = config_ssm["d_model"]

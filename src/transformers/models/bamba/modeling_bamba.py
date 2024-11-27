@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch Jamba model."""
+"""PyTorch Bamba model."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -50,7 +50,7 @@ from ...utils.import_utils import (
     is_flash_attn_greater_or_equal_2_10,
     is_mamba_2_ssm_available,
 )
-from .configuration_placeholder import PlaceholderConfig
+from .configuration_bamba import BambaConfig
 
 
 if is_flash_attn_2_available():
@@ -74,7 +74,7 @@ is_fast_path_available = all(
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "PlaceholderConfig"
+_CONFIG_FOR_DOC = "BambaConfig"
 
 # Copied from transformers.models.mamba2.modeling_mamba2.py
 def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
@@ -129,10 +129,10 @@ def segment_sum(input_tensor):
 
 
 # Copied from transformers.models.jamba.modeling_jamba.JambaRMSNorm
-class PlaceholderRMSNorm(nn.Module):
+class BambaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        PlaceholderRMSNorm is equivalent to T5LayerNorm
+        BambaRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -161,9 +161,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-# Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache
-# - this one servers v2 mixer
-class PlaceholderAttentionDynamicCache(DynamicCache):
+# Adapted from transformers.models.jamba.modeling_jamba.HybridMambaAttentionDynamicCache for the v2 mixer
+class BambaAttentionDynamicCache(DynamicCache):
     """
     A dynamic cache that can handle both the attention cache (which has a seq_len dimension) and the mamba cache
     (which has a constant shape regardless of seq_len).
@@ -177,7 +176,7 @@ class PlaceholderAttentionDynamicCache(DynamicCache):
     and `ssm_states` represents the ssm state and has a shape of `(batch_size, d_inner, d_state)`.
     """
 
-    def __init__(self, config: PlaceholderConfig, batch_size, dtype=torch.float16, device=None):
+    def __init__(self, config: BambaConfig, batch_size, dtype=torch.float16, device=None):
         super().__init__()
         self.dtype = dtype
         self.layers_block_type = config.layers_block_type
@@ -255,20 +254,20 @@ class PlaceholderAttentionDynamicCache(DynamicCache):
         return self.key_cache[layer_idx].shape[-2]
 
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        raise NotImplementedError("PlaceholderAttentionDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("BambaAttentionDynamicCache does not have a legacy cache equivalent.")
 
     @classmethod
     def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
-        raise NotImplementedError("PlaceholderAttentionDynamicCache does not have a legacy cache equivalent.")
+        raise NotImplementedError("BambaAttentionDynamicCache does not have a legacy cache equivalent.")
 
 # Adapted from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding
-class PlaceholderRotaryEmbedding(nn.Module):
-    def __init__(self, config: PlaceholderConfig):
+class BambaRotaryEmbedding(nn.Module):
+    def __init__(self, config: BambaConfig):
         super().__init__()
 
         # FIXME:
         self.dim = config.attn_rotary_emb
-        self.base = 10000.
+        self.base = 10000. # FIXME: not adjustable
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -341,14 +340,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 # Adapted from transformers.models.jamba.modeling_jamba.JambaAttention
-# Adapted from transformers.models.mistral.modeling_mistral.MistralAttention
-class PlaceholderAttention(nn.Module):
+class BambaAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: PlaceholderConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: BambaConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -377,14 +375,14 @@ class PlaceholderAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = PlaceholderRotaryEmbedding(config=self.config)
+        self.rotary_emb = BambaRotaryEmbedding(config=self.config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_value: Optional[BambaAttentionDynamicCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -439,10 +437,9 @@ class PlaceholderAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 # Adapted from transformers.models.jamba.modeling_jamba.JambaFlashAttention2
-# Adapted from transformers.models.mistral.modeling_mistral.MistralFlashAttention2 with Mistral->Jamba
-class PlaceholderFlashAttention2(PlaceholderAttention):
+class BambaFlashAttention2(BambaAttention):
     """
-    Placeholder flash attention module. This module inherits from `PlaceholderAttention` as the weights of the module stays
+    Bamba flash attention module. This module inherits from `BambaAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
@@ -461,7 +458,7 @@ class PlaceholderFlashAttention2(PlaceholderAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_value: Optional[BambaAttentionDynamicCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -541,11 +538,10 @@ class PlaceholderFlashAttention2(PlaceholderAttention):
 
 
 # Adapted from transformers.models.mistral.modeling_mistral.JambaSdpaAttention
-# Adapted from transformers.models.mistral.modeling_mistral.MistralSdpaAttention with Mistral->Jamba
-class PlaceholderSdpaAttention(PlaceholderAttention):
+class BambaSdpaAttention(BambaAttention):
     """
-    Placeholder attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `PlaceholderAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    Bamba attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `BambaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
 
@@ -555,7 +551,7 @@ class PlaceholderSdpaAttention(PlaceholderAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_value: Optional[BambaAttentionDynamicCache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -563,7 +559,7 @@ class PlaceholderSdpaAttention(PlaceholderAttention):
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
-                "PlaceholderModel is using PlaceholderSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "BambaModel is using BambaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
                 'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
             )
             return super().forward(
@@ -630,14 +626,14 @@ class PlaceholderSdpaAttention(PlaceholderAttention):
         return attn_output, None, past_key_value
 
 
-JAMBA_ATTENTION_CLASSES = {
-    "eager": PlaceholderAttention,
-    "flash_attention_2": PlaceholderFlashAttention2,
-    "sdpa": PlaceholderSdpaAttention,
+BAMBA_ATTENTION_CLASSES = {
+    "eager": BambaAttention,
+    "flash_attention_2": BambaFlashAttention2,
+    "sdpa": BambaSdpaAttention,
 }
 
 # Copied from transformers.models.mamba2.modeling_mamba2.MambaRMSNormGated
-class PlaceholderMambaRMSNormGated(torch.nn.Module):
+class BambaRMSNormGated(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -656,7 +652,7 @@ class PlaceholderMambaRMSNormGated(torch.nn.Module):
 
 
 # Copied from transformers.models.mamba2.modeling_mamba2.Mamba2Mixer
-class PlaceholderMambaMixer(nn.Module):
+class BambaMixer(nn.Module):
     """
     Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
     A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
@@ -664,7 +660,7 @@ class PlaceholderMambaMixer(nn.Module):
     and is why Mamba is called **selective** state spaces)
     """
 
-    def __init__(self, config: PlaceholderConfig, layer_idx: int):
+    def __init__(self, config: BambaConfig, layer_idx: int):
         super().__init__()
         self.num_heads = config.mamba_n_heads
         self.hidden_size = config.hidden_size
@@ -716,7 +712,7 @@ class PlaceholderMambaMixer(nn.Module):
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-        self.norm = PlaceholderMambaRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon)
+        self.norm = BambaRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon)
         self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
 
@@ -732,7 +728,7 @@ class PlaceholderMambaMixer(nn.Module):
     def cuda_kernels_forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[PlaceholderAttentionDynamicCache] = None,
+        cache_params: Optional[BambaAttentionDynamicCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         # set up dimensions for reshapes later
@@ -895,7 +891,7 @@ class PlaceholderMambaMixer(nn.Module):
     def torch_forward(
         self,
         input_states,
-        cache_params: Optional[PlaceholderAttentionDynamicCache] = None,
+        cache_params: Optional[BambaAttentionDynamicCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         batch_size, seq_len, _ = input_states.shape
@@ -1096,7 +1092,7 @@ class PlaceholderMambaMixer(nn.Module):
     def forward(
         self,
         hidden_states,
-        cache_params: Optional[PlaceholderAttentionDynamicCache] = None,
+        cache_params: Optional[BambaAttentionDynamicCache] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
@@ -1104,8 +1100,7 @@ class PlaceholderMambaMixer(nn.Module):
         return self.torch_forward(hidden_states, cache_params, attention_mask)
 
 # Copied from transformers.models.jamba.modeling_jamba.JambaMLP
-# Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Jamba
-class PlaceholderMLP(nn.Module):
+class BambaMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1118,28 +1113,28 @@ class PlaceholderMLP(nn.Module):
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
-class PlaceholderDecoderLayer(nn.Module):
-    def __init__(self, config: PlaceholderConfig, layer_idx: int, layer_type: str = 'mamba'):
+class BambaDecoderLayer(nn.Module):
+    def __init__(self, config: BambaConfig, layer_idx: int, layer_type: str = 'mamba'):
         super().__init__()
 
         self.layer_type = layer_type
         if layer_type == 'mamba':
-            self.mamba = PlaceholderMambaMixer(config=config, layer_idx=layer_idx)
+            self.mamba = BambaMixer(config=config, layer_idx=layer_idx)
         elif layer_type == 'attention':
-            self.self_attn = JAMBA_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+            self.self_attn = BAMBA_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
         else:
             raise ValueError("Invalid layer_type")
 
-        self.feed_forward = PlaceholderMLP(config)
-        self.input_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.feed_forward = BambaMLP(config)
+        self.input_layernorm = BambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_ff_layernorm = BambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_value: Optional[BambaAttentionDynamicCache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1164,6 +1159,7 @@ class PlaceholderDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
+        # this is a hybrid decoder layer
         if self.layer_type == 'mamba':
             hidden_states = self.mamba(
                 hidden_states=hidden_states,
@@ -1202,7 +1198,7 @@ class PlaceholderDecoderLayer(nn.Module):
         return outputs
 
 
-PLACEHOLDER_START_DOCSTRING = r"""
+BAMBA_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -1212,7 +1208,7 @@ PLACEHOLDER_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`PlaceholderConfig`]):
+        config ([`BambaConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -1220,14 +1216,14 @@ PLACEHOLDER_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare Placeholder Model outputting raw hidden-states without any specific head on top.",
-    PLACEHOLDER_START_DOCSTRING,
+    "The bare BambaModel outputting raw hidden-states without any specific head on top.",
+    BAMBA_START_DOCSTRING,
 )
-class PlaceholderPreTrainedModel(PreTrainedModel):
-    config_class = PlaceholderConfig 
+class BambaPreTrainedModel(PreTrainedModel):
+    config_class = BambaConfig 
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["PlaceholderDecoderLayer"]
+    _no_split_modules = ["BambaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -1246,7 +1242,7 @@ class PlaceholderPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-PLACEHOLDER_INPUTS_DOCSTRING = r"""
+BAMBA_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1281,14 +1277,14 @@ PLACEHOLDER_INPUTS_DOCSTRING = r"""
             config.n_positions - 1]`.
 
             [What are position IDs?](../glossary#position-ids)
-        past_key_values (`HybridMambaAttentionDynamicCache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        past_key_values (`BambaAttentionDynamicCache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
             A HybridMambaAttentionDynamicCache object containing pre-computed hidden-states (keys and values in the
             self-attention blocks and convolution and ssm states in the mamba blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
             Key and value cache tensors have shape `(batch_size, num_heads, seq_len, head_dim)`.
             Convolution and ssm states tensors have shape `(batch_size, d_inner, d_conv)` and
             `(batch_size, d_inner, d_state)` respectively.
-            See the `HybridMambaAttentionDynamicCache` class for more details.
+            See the `BambaAttentionDynamicCache` class for more details.
 
             If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that
             don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
@@ -1318,19 +1314,19 @@ PLACEHOLDER_INPUTS_DOCSTRING = r"""
 """
 
 @add_start_docstrings(
-    "The bare Jamba Model outputting raw hidden-states without any specific head on top.",
-    PLACEHOLDER_START_DOCSTRING,
+    "The bare Bamba Model outputting raw hidden-states without any specific head on top.",
+    BAMBA_START_DOCSTRING,
 )
 # Adapted from transformers.models.jamba.modeling_jamba.JambaModel
-class PlaceholderModel(PlaceholderPreTrainedModel):
+class BambaModel(BambaPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`PlaceholderDecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`BambaDecoderLayer`]
 
     Args:
-        config: PlaceholderConfig
+        config: BambaConfig
     """
 
-    def __init__(self, config: PlaceholderConfig):
+    def __init__(self, config: BambaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1338,12 +1334,11 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         decoder_layers = []
         for i in range(config.num_hidden_layers):
-            # layer_class = ALL_DECODER_LAYER_TYPES[config.layers_block_type[i]]
-            decoder_layers.append(PlaceholderDecoderLayer(config, layer_idx=i, layer_type=config.layers_block_type[i]))
+            decoder_layers.append(BambaDecoderLayer(config, layer_idx=i, layer_type=config.layers_block_type[i]))
         self.layers = nn.ModuleList(decoder_layers)
 
         self._attn_implementation = config._attn_implementation
-        self.final_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = BambaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1355,13 +1350,13 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(PLACEHOLDER_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(BAMBA_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_values: Optional[BambaAttentionDynamicCache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1392,7 +1387,7 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
 
         if use_cache and past_key_values is None:
             logger.warning_once(
-                "Placeholder requires an initialized `PlaceholderAttentionDynamicCache` to return a cache. None was "
+                "Bamba requires an initialized `BambaAttentionDynamicCache` to return a cache. None was "
                 "provided, so no cache will be returned."
             )
 
@@ -1515,13 +1510,12 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
 
 
 # Adapted from transformers.models.jamba.modeling_jamba.JambaForCausalLM
-# Adapted from transformers.models.mixtral.modeling_mixtral.MixtralForCausalLM with MIXTRAL->JAMBA, Mixtral->Jamba
-class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
+class BambaForCausalLM(BambaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: PlaceholderConfig):
+    def __init__(self, config: BambaConfig):
         super().__init__(config)
-        self.model = PlaceholderModel(config)
+        self.model = BambaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
@@ -1545,7 +1539,7 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(PLACEHOLDER_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(BAMBA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     # Ignore copy
     def forward(
@@ -1553,7 +1547,7 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[PlaceholderAttentionDynamicCache] = None,
+        past_key_values: Optional[BambaAttentionDynamicCache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1581,10 +1575,10 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, JambaForCausalLM
+        >>> from transformers import AutoTokenizer, BambaForCausalLM
 
-        >>> model = JambaForCausalLM.from_pretrained("ai21labs/Jamba-v0.1")
-        >>> tokenizer = AutoTokenizer.from_pretrained("ai21labs/Jamba-v0.1")
+        >>> model = BambaForCausalLM.from_pretrained("...")
+        >>> tokenizer = AutoTokenizer.from_pretrained("...")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1650,7 +1644,7 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
         use_cache=True,
         **kwargs,
     ):
-        # Overwitten -- has a unique cache type, `PlaceholderAttentionDynamicCache`
+        # Overwitten -- has a unique cache type, `BambaAttentionDynamicCache`
 
         empty_past_kv = past_key_values is None
 
@@ -1663,7 +1657,7 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
             elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
                 input_ids = input_ids[:, cache_position]
         else:
-            past_key_values = PlaceholderAttentionDynamicCache(
+            past_key_values = BambaAttentionDynamicCache(
                 self.config, input_ids.shape[0], self.dtype, device=self.device
             )
 
@@ -1697,9 +1691,9 @@ class PlaceholderForCausalLM(PlaceholderPreTrainedModel, GenerationMixin):
     def _supports_default_dynamic_cache(self) -> bool:
         """
         Return `True` if current model can use a `DynamicCache` instance when initializing the `past_key_values`.
-        This is mostly the same as `_supports_cache_class` attribute, but add exception for `Jamba` model which
-        uses its own `HybridMambaAttentionDynamicCache` and do not need to initialize the Cache in advance in
+        This is mostly the same as `_supports_cache_class` attribute, but add exception for `Bamba` model which
+        uses its own `BambaAttentionDynamicCache` and do not need to initialize the Cache in advance in
         order to save memory (because no back and forth `to_legacy_cache` and `from_legacy_cache` will be performed
-        for `HybridMambaAttentionDynamicCache`).
+        for `BambaAttentionDynamicCache`).
         """
         return False
