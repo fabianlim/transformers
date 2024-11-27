@@ -139,9 +139,9 @@ class BambaConfig(PretrainedConfig):
         attn_rotary_emb=None,
         use_mamba_kernels=True,
         mamba_n_heads=128,
-        mamba_d_head=64,
+        mamba_d_head="auto",
         mamba_n_groups=1,
-        mamba_d_state=16,
+        mamba_d_state=256,
         mamba_d_conv=4,
         mamba_expand=2,
         mamba_chunk_size=256,
@@ -174,6 +174,16 @@ class BambaConfig(PretrainedConfig):
         self.attn_layer_indices = attn_layer_indices
         self.attn_rotary_emb = attn_rotary_emb
 
+        mamba_intermediate = mamba_expand * hidden_size
+        
+        assert mamba_intermediate % mamba_n_heads == 0, \
+            "mamba_n_heads must divide mamba_expand * hidden_size"
+
+        # for the mamba_v2, must satisfy the following
+        if mamba_d_head == "auto":
+            mamba_d_head = mamba_intermediate // mamba_n_heads
+        assert mamba_d_head * mamba_n_heads == mamba_intermediate
+
         self.use_mamba_kernels = use_mamba_kernels
         self.mamba_n_heads = mamba_n_heads
         self.mamba_d_head = mamba_d_head
@@ -186,6 +196,7 @@ class BambaConfig(PretrainedConfig):
         self.mamba_conv_bias = mamba_conv_bias
         self.mamba_proj_bias = mamba_proj_bias
 
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -197,6 +208,8 @@ class BambaConfig(PretrainedConfig):
     @property
     def layers_block_type(self):
         return [
-            "attention" if i in self.attn_layer_indices else "mamba"
+            "attention" if (
+                self.attn_layer_indices and i in self.attn_layer_indices 
+            ) else "mamba"
             for i in range(self.num_hidden_layers)
         ]
