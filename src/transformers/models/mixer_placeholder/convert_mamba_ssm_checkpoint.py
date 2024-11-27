@@ -1,6 +1,5 @@
 # coding=utf-8
-# Copyright 2024 state-spaces/mamba2 org and HuggingFace Inc. team.
-# Copyright IBM 2024
+# Copyright 2024 IBM and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

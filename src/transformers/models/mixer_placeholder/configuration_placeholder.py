@@ -148,7 +148,7 @@ class PlaceholderConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         # max_position_embeddings=262144,
-        # attention_dropout=0.0,
+        attention_dropout=0.0,
         attn_layer_indices=None,
         attn_rotary_emb=None,
         use_mamba_kernels=True,
@@ -170,9 +170,8 @@ class PlaceholderConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        # self.sliding_window = sliding_window
         # self.max_position_embeddings = max_position_embeddings
-        # self.attention_dropout = attention_dropout
+        self.attention_dropout = attention_dropout
 
         # for backward compatibility
         if num_key_value_heads is None:

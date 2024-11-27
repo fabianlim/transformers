@@ -1118,10 +1118,17 @@ class PlaceholderMLP(nn.Module):
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
-class PlaceholderAttentionDecoderLayer(nn.Module):
-    def __init__(self, config: PlaceholderConfig, layer_idx: int):
+class PlaceholderDecoderLayer(nn.Module):
+    def __init__(self, config: PlaceholderConfig, layer_idx: int, layer_type: str = 'mamba'):
         super().__init__()
-        self.self_attn = JAMBA_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+
+        self.layer_type = layer_type
+        if layer_type == 'mamba':
+            self.mamba = PlaceholderMambaMixer(config=config, layer_idx=layer_idx)
+        elif layer_type == 'attention':
+            self.self_attn = JAMBA_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        else:
+            raise ValueError("Invalid layer_type")
 
         self.feed_forward = PlaceholderMLP(config)
         self.input_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1157,15 +1164,23 @@ class PlaceholderAttentionDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-        )
+        if self.layer_type == 'mamba':
+            hidden_states = self.mamba(
+                hidden_states=hidden_states,
+                cache_params=past_key_value,
+                attention_mask=attention_mask,
+            )
+            self_attn_weights, cache_output = None, past_key_value
+        elif self.layer_type == 'attention':
+            hidden_states, self_attn_weights, cache_output = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
 
         # residual connection after attention
         hidden_states = residual + hidden_states
@@ -1182,74 +1197,7 @@ class PlaceholderAttentionDecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         if use_cache:
-            outputs += (present_key_value,)
-
-        return outputs
-
-
-class PlaceholderMambaDecoderLayer(nn.Module):
-    def __init__(self, config: PlaceholderConfig, layer_idx: int):
-        super().__init__()
-
-        self.mamba = PlaceholderMambaMixer(config=config, layer_idx=layer_idx)
-
-        self.feed_forward = PlaceholderMLP(config)
-        self.input_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = PlaceholderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[PlaceholderAttentionDynamicCache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            past_key_value (`HybridMambaAttentionDynamicCache`, *optional*): cached past key and value projection states
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-        """
-
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        hidden_states = self.mamba(
-            hidden_states=hidden_states,
-            cache_params=past_key_value,
-            attention_mask=attention_mask,
-        )
-        self_attn_weights = None
-
-        # residual connection after mamba
-        hidden_states = residual + hidden_states
-
-        # feed-forward
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
-        hidden_states = self.feed_forward(hidden_states)
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (past_key_value,)
+            outputs += (cache_output,)
 
         return outputs
 
@@ -1279,7 +1227,7 @@ class PlaceholderPreTrainedModel(PreTrainedModel):
     config_class = PlaceholderConfig 
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["PlaceholderAttentionDecoderLayer", "PlaceholderMambaDecoderLayer"]
+    _no_split_modules = ["PlaceholderDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -1369,9 +1317,6 @@ PLACEHOLDER_INPUTS_DOCSTRING = r"""
             the complete sequence length.
 """
 
-ALL_DECODER_LAYER_TYPES = {"attention": PlaceholderAttentionDecoderLayer, "mamba": PlaceholderMambaDecoderLayer}
-
-
 @add_start_docstrings(
     "The bare Jamba Model outputting raw hidden-states without any specific head on top.",
     PLACEHOLDER_START_DOCSTRING,
@@ -1393,8 +1338,8 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         decoder_layers = []
         for i in range(config.num_hidden_layers):
-            layer_class = ALL_DECODER_LAYER_TYPES[config.layers_block_type[i]]
-            decoder_layers.append(layer_class(config, layer_idx=i))
+            # layer_class = ALL_DECODER_LAYER_TYPES[config.layers_block_type[i]]
+            decoder_layers.append(PlaceholderDecoderLayer(config, layer_idx=i, layer_type=config.layers_block_type[i]))
         self.layers = nn.ModuleList(decoder_layers)
 
         self._attn_implementation = config._attn_implementation
@@ -1464,7 +1409,7 @@ class PlaceholderModel(PlaceholderPreTrainedModel):
 
         for decoder_layer in self.layers:
             # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
-            layer_mask = mamba_mask if isinstance(decoder_layer, PlaceholderMambaDecoderLayer) else causal_mask
+            layer_mask = mamba_mask if decoder_layer.layer_type == 'mamba' else causal_mask
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
