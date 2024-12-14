@@ -14,6 +14,9 @@
 # limitations under the License.
 """Testing suite for the PyTorch Bamba model."""
 
+from transformers import set_seed
+set_seed(1)
+
 import unittest
 
 from parameterized import parameterized
@@ -41,7 +44,6 @@ if is_torch_available():
     from transformers.models.bamba.modeling_bamba import (
         HybridMambaAttentionDynamicCache,
     )
-
 
 class BambaModelTester:
     def __init__(
@@ -105,7 +107,12 @@ class BambaModelTester:
         self.mamba_chunk_size = mamba_chunk_size
 
     def prepare_config_and_inputs(self):
-        input_ids = ids_tensor([self.batch_size, self.seq_length], self.vocab_size)
+
+        import random
+        rng = random.Random(1)
+        input_ids = ids_tensor(
+            [self.batch_size, self.seq_length], self.vocab_size, rng=rng
+        )
 
         input_mask = None
         if self.use_input_mask:
@@ -113,7 +120,10 @@ class BambaModelTester:
 
         token_labels = None
         if self.use_labels:
-            token_labels = ids_tensor([self.batch_size, self.seq_length], self.num_labels)
+            token_labels = ids_tensor(
+                [self.batch_size, self.seq_length], self.num_labels,
+                rng=rng
+            )
 
         config = self.get_config()
 
