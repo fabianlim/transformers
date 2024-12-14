@@ -575,6 +575,7 @@ class BambaSdpaAttention(BambaAttention):
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
+
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         is_causal = True if causal_mask is None and q_len > 1 else False
@@ -1649,13 +1650,13 @@ class BambaModel(BambaPreTrainedModel):
             if attention_mask is not None:
                 causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
                 mask_length = attention_mask.shape[-1]
-                padding_attention_mask = (attention_mask[:, None, None, :] == attention_mask[:, None, :, None])[
+                # this is not the way it is done in other models, but 
+                # it seems to be the most logical
+                mask = (attention_mask[:, None, None, :] * attention_mask[:, None, :, None])[
                     :, :, -sequence_length:, :
-                ].to(dtype)
-                padding_mask = causal_mask[:, :, :, :mask_length] + padding_attention_mask
-                padding_mask = padding_mask == 0
+                ]
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
+                    mask.logical_not(), min_dtype
                 )
 
         return causal_mask
