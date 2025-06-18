@@ -195,7 +195,7 @@ def main(
                 config.hidden_size //
                 config.num_attention_heads
             )
-            config.partial_rotary_config = (
+            config.partial_rotary_factor = (
                 config.attn_rotary_emb // head_dim
             )
             try:
