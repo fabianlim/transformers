@@ -183,23 +183,25 @@ def main(
         with open(config_path, "r", encoding="utf-8") as json_file:
             config_data = json.load(json_file)
 
-        # have the fix here
-        if 'attn_rotary_emb' in config_data:
-            head_dim = (
-                config_data['hidden_size'] //
-                config_data['num_attention_heads']
-            )
-            config_data['partial_rotary_config'] = (
-                config_data['attn_rotary_emb'] //
-                head_dim
-            )
-            del config_data['attn_rotary_emb']
-
         config = convert_ssm_config_to_hf_config(
             config_ssm=config_data,
             **token_ids,
             **unsettables,
         )
+
+        # have the fix here
+        if hasattr(config, 'attn_rotary_emb'):
+            head_dim = (
+                config.hidden_size //
+                config.num_attention_heads
+            )
+            config.partial_rotary_config = (
+                config.attn_rotary_emb // head_dim
+            )
+            try:
+                delattr(config, 'attn_rotary_emb')
+            except:
+                pass
 
         # Load state dict of the original model and transfer to hf model
         state_dict = torch.load(
