@@ -1051,7 +1051,7 @@ class GraniteMoeHybridDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         # Either attention or mamba will be initialized, depending on the layer type.
         self.self_attn = None
-        self.block_sparse_moe = GraniteMoeHybridMoE(config)
+        self.block_sparse_moe = None if config.num_local_experts == 0 else GraniteMoeHybridMoE(config)
         self.input_layernorm = GraniteMoeHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GraniteMoeHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1131,7 +1131,10 @@ class GraniteMoeHybridDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        moe_hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        if self.block_sparse_moe:
+            moe_hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        else:
+            moe_hidden_states, router_logits = 0, None
 
         hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
